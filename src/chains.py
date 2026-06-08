@@ -1,5 +1,5 @@
 from langchain_groq import ChatGroq
-from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.messages import AIMessage
 from src.config import GROQ_API_KEY, MODEL_NAME
 from src.prompts import (
@@ -10,12 +10,21 @@ from src.prompts import (
 )
 import json
 
-# Initialize LLM with temperature settings
-GROQ_LLM = ChatGroq(
-    api_key=GROQ_API_KEY, 
-    model=MODEL_NAME,
-    temperature=0.1  # Lower temperature for more consistent outputs
-)
+_groq_llm = None
+
+def get_groq_llm() -> ChatGroq:
+    global _groq_llm
+    if _groq_llm is None:
+        if not GROQ_API_KEY:
+            raise ValueError(
+                "GROQ_API_KEY is not set. Add it to .env in the project root."
+            )
+        _groq_llm = ChatGroq(
+            api_key=GROQ_API_KEY,
+            model=MODEL_NAME,
+            temperature=0.1,
+        )
+    return _groq_llm
 
 def create_json_parser_with_fallback():
     """Creates a JSON parser with error handling"""
@@ -23,19 +32,16 @@ def create_json_parser_with_fallback():
     
     def parse_with_fallback(text_or_message) -> dict:
         try:
-            # Handle AIMessage objects
             if isinstance(text_or_message, AIMessage):
                 text = text_or_message.content
             else:
                 text = str(text_or_message)
 
-            # First try direct parsing
             try:
                 return json.loads(text)
             except:
                 pass
 
-            # Clean and try parsing again
             clean_text = text.strip()
             start = clean_text.find('{')
             end = clean_text.rfind('}')
@@ -47,19 +53,23 @@ def create_json_parser_with_fallback():
                 except:
                     pass
 
-            # For research router specifically
             if "router_decision" in text.lower():
                 if "research_info" in text.lower():
                     return {"router_decision": "research_info"}
                 else:
                     return {"router_decision": "draft_email"}
 
-            # If all parsing attempts fail, extract from text or return default
+            if "category" in text.lower():
+                return {
+                    "category": "product_inquiry",
+                    "urgency_level": "low",
+                    "needs_human_escalation": False,
+                    "reasoning": "",
+                }
+
             if "email_draft" in text.lower():
-                # For email drafts, preserve the full text
                 return {"email_draft": text}
             elif "keywords" in text.lower():
-                # For keywords, try to extract them
                 return {"keywords": ["default_keyword"]}
             else:
                 return {"error": "Parsing failed", "original_text": text}
@@ -69,27 +79,22 @@ def create_json_parser_with_fallback():
 
     return parse_with_fallback
 
-# Initialize Chains with improved error handling
-email_category_chain = (
-    EMAIL_CATEGORIZER_PROMPT 
-    | GROQ_LLM 
-    | (lambda x: x.content if isinstance(x, AIMessage) else str(x))
-)
+class LazyChain:
+    """Builds an LCEL chain on first invoke to defer LLM initialization."""
 
-research_router_chain = (
-    RESEARCH_ROUTER_PROMPT 
-    | GROQ_LLM 
-    | create_json_parser_with_fallback()
-)
+    def __init__(self, prompt):
+        self._prompt = prompt
+        self._chain = None
 
-search_keyword_chain = (
-    SEARCH_KEYWORDS_PROMPT 
-    | GROQ_LLM 
-    | create_json_parser_with_fallback()
-)
+    def _get_chain(self):
+        if self._chain is None:
+            self._chain = self._prompt | get_groq_llm() | create_json_parser_with_fallback()
+        return self._chain
 
-draft_writer_chain = (
-    EMAIL_DRAFT_PROMPT 
-    | GROQ_LLM 
-    | create_json_parser_with_fallback()
-)
+    def invoke(self, *args, **kwargs):
+        return self._get_chain().invoke(*args, **kwargs)
+
+email_category_chain = LazyChain(EMAIL_CATEGORIZER_PROMPT)
+research_router_chain = LazyChain(RESEARCH_ROUTER_PROMPT)
+search_keyword_chain = LazyChain(SEARCH_KEYWORDS_PROMPT)
+draft_writer_chain = LazyChain(EMAIL_DRAFT_PROMPT)
