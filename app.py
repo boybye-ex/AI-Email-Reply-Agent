@@ -1,6 +1,16 @@
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 import streamlit as st
 from src.workflow import create_workflow
+from src.config import GROQ_API_KEY, TAVILY_API_KEY
 import json
+
+MISSING_API_KEYS_MESSAGE = (
+    "Missing API keys. Copy .env.example to .env and add your Groq and Tavily keys."
+)
 
 def initialize_session_state():
     if 'history' not in st.session_state:
@@ -9,6 +19,8 @@ def initialize_session_state():
         st.session_state.current_email = None
     if 'current_response' not in st.session_state:
         st.session_state.current_response = None
+    if 'current_triage' not in st.session_state:
+        st.session_state.current_triage = None
     if 'response_counter' not in st.session_state:
         st.session_state.response_counter = 0
 
@@ -52,6 +64,15 @@ The Bhavik Team""",
                     st.markdown("---")
         
         return email_content, generate_button
+
+def extract_triage_metadata(output: dict) -> dict:
+    """Extract triage metadata from workflow output."""
+    return {
+        "email_category": output.get("email_category", "unknown"),
+        "urgency_level": output.get("urgency_level", "low"),
+        "needs_human_escalation": output.get("needs_human_escalation", False),
+        "escalation_reasoning": output.get("escalation_reasoning", ""),
+    }
     
 def extract_email_draft(response_text: str) -> str:
     """Extract email draft from the response text."""
@@ -92,14 +113,45 @@ def process_email(email_content):
             }
             output = app.invoke(inputs)
             response = output.get('draft_email', 'Unable to process email')
+            triage = extract_triage_metadata(output)
             
-            # Extract just the email draft text
             clean_response = extract_email_draft(response)
-            return clean_response, None
+            return clean_response, triage, None
+    except ValueError as e:
+        if "GROQ_API_KEY" in str(e):
+            return None, None, MISSING_API_KEYS_MESSAGE
+        return None, None, str(e)
     except Exception as e:
-        return None, str(e)
+        return None, None, str(e)
 
-def display_response_section(response, is_new=False):
+def display_triage_banner(triage: dict):
+    """Display urgency and escalation status from triage metadata."""
+    if not triage:
+        return
+
+    if triage.get("needs_human_escalation"):
+        st.warning(
+            "Human review required — escalated to senior support. "
+            "A draft has been generated, but please review before sending."
+        )
+    else:
+        st.success(
+            f"Category: **{triage.get('email_category', 'unknown')}** | "
+            f"Urgency: **{triage.get('urgency_level', 'low')}**"
+        )
+
+    with st.expander("Triage Details", expanded=triage.get("needs_human_escalation", False)):
+        st.markdown(f"**Category:** {triage.get('email_category', 'unknown')}")
+        st.markdown(f"**Urgency Level:** {triage.get('urgency_level', 'low')}")
+        st.markdown(
+            f"**Needs Human Escalation:** "
+            f"{'Yes' if triage.get('needs_human_escalation') else 'No'}"
+        )
+        reasoning = triage.get("escalation_reasoning", "")
+        if reasoning:
+            st.markdown(f"**Reasoning:** {reasoning}")
+
+def display_response_section(response, triage=None, is_new=False):
     if is_new:
         st.session_state.response_counter += 1
     
@@ -107,6 +159,7 @@ def display_response_section(response, is_new=False):
     
     if response:
         st.markdown('<p class="section-title">📨 Generated Response</p>', unsafe_allow_html=True)
+        display_triage_banner(triage)
         tabs = st.tabs(["✏️ Editor", "👀 Preview", "💾 Drafts"])
         
         with tabs[0]:
@@ -129,7 +182,8 @@ def display_response_section(response, is_new=False):
                             use_container_width=True):
                     st.session_state.history.append({
                         "email": st.session_state.current_email,
-                        "response": edited_response
+                        "response": edited_response,
+                        "triage": triage or {},
                     })
                     st.toast("Draft saved! 💾")
         
@@ -142,6 +196,13 @@ def display_response_section(response, is_new=False):
             if st.session_state.history:
                 for idx, item in enumerate(reversed(st.session_state.history)):
                     with st.expander(f"Draft {len(st.session_state.history) - idx}", expanded=False):
+                        item_triage = item.get("triage", {})
+                        if item_triage:
+                            st.caption(
+                                f"Category: {item_triage.get('email_category', 'unknown')} | "
+                                f"Urgency: {item_triage.get('urgency_level', 'low')} | "
+                                f"Escalated: {'Yes' if item_triage.get('needs_human_escalation') else 'No'}"
+                            )
                         st.text_area(
                             "Response",
                             item["response"],
@@ -158,16 +219,20 @@ def main():
         layout="wide",
         initial_sidebar_state="collapsed",
         menu_items={
-            'Get help': None,  # Remove help link
-            'Report a bug': None,  # Remove bug report link
-            'About': None  # Remove about link
+            'Get help': None,
+            'Report a bug': None,
+            'About': None
         }
     )
     
     initialize_session_state()
+
+    if not GROQ_API_KEY or not TAVILY_API_KEY:
+        st.error(MISSING_API_KEYS_MESSAGE)
+        st.stop()
+
     display_header()
     
-    # Create two columns with a bit more space for the response
     col1, col2 = st.columns([4, 5])
     
     with col1:
@@ -179,16 +244,20 @@ def main():
         st.markdown('<div class="content-box">', unsafe_allow_html=True)
         if generate_clicked and email_content:
             st.session_state.current_email = email_content
-            response, error = process_email(email_content)
+            response, triage, error = process_email(email_content)
             
             if error:
                 st.error(f"❌ An error occurred: {error}")
             else:
                 st.session_state.current_response = response
-                display_response_section(response, is_new=True)
+                st.session_state.current_triage = triage
+                display_response_section(response, triage=triage, is_new=True)
         
         elif st.session_state.current_response:
-            display_response_section(st.session_state.current_response)
+            display_response_section(
+                st.session_state.current_response,
+                triage=st.session_state.current_triage,
+            )
         
         else:
             st.info("Generate a response to see it here!")
